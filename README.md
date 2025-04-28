@@ -1,5 +1,5 @@
 # V-GPS: Value-Guided Policy Steering
-This is the implementation for our paper [Steering Your Generalists: Improving Robotic Foundation Models via Value Guidance](https://arxiv.org/abs/2303.05479) (CoRL 2024). 
+This is the implementation for our paper [Steering Your Generalists: Improving Robotic Foundation Models via Value Guidance](https://arxiv.org/abs/2410.13816) (CoRL 2024). 
 - paper link: https://arxiv.org/abs/2410.13816
 - project page: https://nakamotoo.github.io/V-GPS/
 - video: https://youtu.be/d5Yd_gJoZo0
