@@ -139,6 +139,31 @@ def get_config(config_string):
                 **base_real_config,
             )
         ),
+        "sarsa": ConfigDict(
+            dict(
+                agent="sarsa",
+                agent_kwargs=dict(
+                    learning_rate=3e-4,
+                    warmup_steps=2000,
+                    discount=0.98,
+                    target_update_rate=5e-3,
+                    critic_ensemble_size=2,
+                    use_min_q=True,  # Use min over ensemble to reduce overestimation
+                    network_kwargs = dict(
+                        hidden_dims = [256, 256],
+                        activate_final = True,
+                        use_layer_norm = False,
+                    ),
+                ),
+                encoder="resnetv1-34-bridge-film",
+                encoder_kwargs=dict(
+                    pooling_method="avg",
+                    add_spatial_coordinates=True,
+                    act="swish",
+                ),
+                **base_real_config,
+            )
+),
     }
 
     return possible_structures[config_string]

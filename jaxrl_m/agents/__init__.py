@@ -6,6 +6,7 @@ from .continuous.gc_ddpm_bc import GCDDPMBCAgent
 from .continuous.gc_iql import GCIQLAgent
 from .continuous.iql import IQLAgent
 from .continuous.sac import SACAgent
+from .continuous.sarsa import SARSAAgent  # Add this line
 
 agents = {
     "gc_bc": GCBCAgent,
@@ -16,4 +17,5 @@ agents = {
     "cql": ContinuousCQLAgent,
     "calql": CalQLAgent,
     "sac": SACAgent,
+    "sarsa": SARSAAgent,  # Add this line
 }

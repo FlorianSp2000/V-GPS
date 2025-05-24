@@ -56,6 +56,9 @@ def main(_):
     devices = jax.local_devices()
     num_devices = len(devices)
     assert FLAGS.config.batch_size % num_devices == 0
+    print(f"JAX version: {jax.__version__}")
+    print(f"Available devices: {jax.devices()}")
+    print(f"Default backend: {jax.default_backend()}")
 
     # we shard the leading dimension (batch dimension) accross all devices evenly
     sharding = jax.sharding.PositionalSharding(devices)

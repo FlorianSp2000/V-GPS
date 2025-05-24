@@ -1,5 +1,5 @@
-data_dir="path to your oxe dataset" # FILL IN
-save_dir="<your save dir>" # FILL IN
+data_dir=datasets/open_x # FILL IN
+save_dir="results/" # FILL IN
 
 
 PROJECT=VGPS
