@@ -106,6 +106,7 @@ def get_config():
             action_proprio_normalization_type=NormalizationType.BOUNDS, # we normalize actions to [-1, 1] with min max bounds,
         ),
         traj_transform_kwargs=dict(
+            window_size=1,  # ADDED by me
             action_horizon=1,
             max_action_dim=action_dim,
             task_augment_strategy="delete_task_conditioning",

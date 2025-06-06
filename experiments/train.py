@@ -56,9 +56,6 @@ def main(_):
     devices = jax.local_devices()
     num_devices = len(devices)
     assert FLAGS.config.batch_size % num_devices == 0
-    print(f"JAX version: {jax.__version__}")
-    print(f"Available devices: {jax.devices()}")
-    print(f"Default backend: {jax.default_backend()}")
 
     # we shard the leading dimension (batch dimension) accross all devices evenly
     sharding = jax.sharding.PositionalSharding(devices)
@@ -72,6 +69,7 @@ def main(_):
     wandb_config.update({"project": FLAGS.project, "exp_descriptor": FLAGS.name})
     variant = FLAGS.config.to_dict()
     variant["oxe_config"] = FLAGS.oxedata_config.to_dict()
+    logging.info(f"variant: {variant}")
     wandb_logger = WandBLogger(
         wandb_config=wandb_config, variant=variant,
     )
@@ -96,6 +94,56 @@ def main(_):
             )
         return batch
 
+    def check_temporal_coherence(data_iter, num_checks=3):
+        """
+        Check if consecutive timesteps appear together in batches
+        """
+        logging.info("=== CHECKING TEMPORAL COHERENCE ===")
+                
+        for check_idx in range(num_checks):
+            try:
+                batch = next(data_iter)
+                
+                logging.info(f"\n--- Batch {check_idx} ---")
+                logging.info(f"Batch size: {batch['observations']['image'].shape[0]}")
+                logging.info(f"Actions shape: {batch['actions'].shape}")
+                logging.info(f"Available keys: {list(batch.keys())}")
+                                
+                # Check if masks provide trajectory boundary info
+                if 'masks' in batch:
+                    masks = batch['masks']
+                    logging.info(f"Masks shape: {masks.shape}")
+                    logging.info(f"Mask values (first 10): {masks[:10]}")
+                    
+                    # Count trajectory boundaries (where mask is 0)
+                    boundaries = jnp.sum(masks == 0)
+                    logging.info(f"Trajectory boundaries in batch: {boundaries}")
+                
+                # Smoking gun test: check if next_obs[i] == obs[i+1]
+                if batch['observations']['image'].shape[0] > 1:
+                    obs_current = batch['observations']['image'][0]
+                    obs_next = batch['next_observations']['image'][0] 
+                    obs_following = batch['observations']['image'][1]
+                    
+                    # If temporally coherent, next_obs[0] should equal obs[1]
+                    pixel_diff = jnp.mean(jnp.abs(obs_next - obs_following))
+                    logging.info(f"Pixel diff between next_obs[0] and obs[1]: {pixel_diff}")
+                    
+                    if pixel_diff < 1e-6:
+                        logging.info("✓ TEMPORAL COHERENCE MAINTAINED")
+                    else:
+                        logging.info("✗ TEMPORAL COHERENCE BROKEN (shuffled)")
+                
+                # Check action smoothness
+                actions = batch['actions'][:5]
+                if len(actions) > 1:
+                    action_diffs = jnp.diff(actions, axis=0)
+                    avg_action_diff = jnp.mean(jnp.abs(action_diffs))
+                    logging.info(f"Avg action difference: {avg_action_diff}")
+                                
+            except Exception as e:
+                logging.error(f"Error in coherence check {check_idx}: {e}")
+                break    
     def process_oxe_batch(batch):
         """
         Process a batch from the oxe dataset to be compatible with jaxrl_minimal
@@ -103,7 +151,10 @@ def main(_):
         return process_text(
             dict(
                 actions=batch["action"].squeeze(),
-                goals=dict(language=batch["task"]["language_instruction"]),
+                next_actions=batch["next_action"].squeeze(),
+                goals=dict(
+                    language=batch["task"]["language_instruction"],  # Will be MUSE encoded
+                    ),
                 mc_returns=batch["mc_return"],
                 observations=dict(image=batch["observation"]["image_primary"].squeeze()),
                 next_observations=dict(image=batch["next_observation"]["image_primary"].squeeze()),
@@ -112,7 +163,7 @@ def main(_):
             )
         )
 
-    print(FLAGS.oxedata_config)
+    logging.info(f"oxedata_config: {FLAGS.oxedata_config}")
     if "oxe_kwargs" in FLAGS.oxedata_config:
         # create dataset_kwargs_list from oxe_kwargs
         (
@@ -152,7 +203,7 @@ def main(_):
                 .shuffle(1000)
                 .repeat()
                 .batch(FLAGS.oxedata_config.batch_size)
-                .iterator(prefetch=0)
+                .iterator(prefetch=0) # TODO: try prefetch=tf.data.AUTOTUNE
         )
 
         val_data_fractal_iter = map(shard_fn, map(process_oxe_batch, val_data_fractal_iter))
@@ -185,14 +236,17 @@ def main(_):
             .shuffle(1000)
             .repeat()
             .batch(FLAGS.oxedata_config.batch_size)
-            .iterator(prefetch=0)
+            .iterator(prefetch=0) # TODO: try prefetch=tf.data.AUTOTUNE
     )
 
     val_data_iter = map(shard_fn, map(process_oxe_batch, val_data_iter))
+    logging.info("=== CHECKING VALIDATION TRAJECTORY DATA ===")
     prev_val_traj = next(val_traj_data_iter)
+    logging.info(f"Val traj keys: {list(prev_val_traj.keys())}")
+    logging.info(f"Val traj actions shape: {prev_val_traj['actions'].shape}")
 
     train_data_iter = map(
-        shard_fn, map(process_oxe_batch, train_data.iterator(prefetch=0))
+        shard_fn, map(process_oxe_batch, train_data.iterator(prefetch=0)) # TODO: try prefetch=tf.data.AUTOTUNE
     )
 
     example_batch = next(train_data_iter)
@@ -201,6 +255,13 @@ def main(_):
     logging.info(
         f"Batch size per device: {example_batch['observations']['image'].shape[0] // num_devices}"
     )
+    # logging.info("Starting temporal coherence check...")
+    # check_temporal_coherence(train_data_iter, num_checks=3)
+    # logging.info("Temporal coherence check completed.")
+
+    # logging.info("Starting temporal coherence check for trajectory data...")
+    # check_temporal_coherence(val_traj_data_iter, num_checks=3)
+    # logging.info("Temporal coherence check completed.")
 
     # define encoder
     encoder_def = encoders[FLAGS.config.encoder](**FLAGS.config.encoder_kwargs)
@@ -208,6 +269,7 @@ def main(_):
     # initialize agent
     rng = jax.random.PRNGKey(FLAGS.config.seed)
     rng, construct_rng = jax.random.split(rng)
+    logging.info(f"example_batch['goals'] {example_batch['goals']}")
     agent = agents[FLAGS.config.agent].create(
         rng=construct_rng,
         observations=example_batch["observations"],
@@ -228,6 +290,14 @@ def main(_):
 
         timer.tick("dataset")
         batch = next(train_data_iter)
+        
+        # logging.info(f"=== BATCH DEBUG INFO ===")
+        # logging.info(f"batch.keys() {batch.keys()}")
+        # logging.info(f"Sample action batch['actions'][0]: {batch['actions'][0]}")
+        # logging.info(f"Sample action batch['actions'][1]: {batch['actions'][1]}")
+        # logging.info(f"Sample next_action batch['next_actions'][0]: {batch['next_actions'][0]}")
+        # logging.info(f"Sample next_action batch['next_actions'][1]: {batch['next_actions'][1]}")
+
         timer.tock("dataset")
 
         timer.tick("train")
@@ -254,7 +324,7 @@ def main(_):
                 metrics = jax.tree_map(lambda *xs: np.mean(xs), *metrics)
                 wandb_logger.log({"validation/fractal": metrics}, step=i)
 
-            if "iql" in FLAGS.config.agent or "mc_regress" in FLAGS.config.agent or "cql" in FLAGS.config.agent:
+            if "iql" in FLAGS.config.agent or "mc_regress" in FLAGS.config.agent or "cql" in FLAGS.config.agent or "sarsa" in FLAGS.config.agent:
                 logging.info("Plotting value functions..")
                 for num in range(3):
                     traj = next(val_traj_data_iter)

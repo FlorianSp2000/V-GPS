@@ -143,27 +143,47 @@ def get_config(config_string):
             dict(
                 agent="sarsa",
                 agent_kwargs=dict(
+                    # Goal conditioning (same as CQL pattern)
+                    language_conditioned=True,
+                    goal_conditioned=True,
+                    early_goal_concat=None,
+                    shared_goal_encoder=None,
+                    shared_encoder=False,
+                    
+                    # Learning parameters
                     learning_rate=3e-4,
                     warmup_steps=2000,
                     discount=0.98,
-                    target_update_rate=5e-3,
+                    soft_target_update_rate=5e-3,  # TODO: was target_update_rate but sac.py also uses soft_target_update_rate
+                    
+                    # Critic configuration
                     critic_ensemble_size=2,
+                    critic_subsample_size=None,
                     use_min_q=True,  # Use min over ensemble to reduce overestimation
-                    network_kwargs = dict(
-                        hidden_dims = [256, 256],
-                        activate_final = True,
-                        use_layer_norm = False,
+                    
+                    network_kwargs=dict(
+                        hidden_dims=[256, 256],
+                        activate_final=True,
+                        use_layer_norm=False,
                     ),
                 ),
+                
+                # Text processing (same as CQL)
+                text_processor="muse_embedding",
+                text_processor_kwargs=dict(),
+                
+                # Encoder (same as CQL)
                 encoder="resnetv1-34-bridge-film",
                 encoder_kwargs=dict(
                     pooling_method="avg",
                     add_spatial_coordinates=True,
                     act="swish",
                 ),
+                
+                # Base config
                 **base_real_config,
             )
-),
+        ),
     }
 
     return possible_structures[config_string]
