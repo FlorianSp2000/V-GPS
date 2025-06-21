@@ -343,7 +343,7 @@ class SARSAAgent(flax.struct.PyTreeNode):
                     for k, v in goals.items():
                         rep = jnp.repeat(v[-1:], num_repeat, axis=0)
                         goals[k] = jnp.concatenate([v, rep], axis=0)
-        logging.info(f"goals['language'].shape: {goals['language'].shape}")
+
         metrics = self.get_eval_values(traj, seed, goals)
         images = traj["observations"]["image"].squeeze()
         

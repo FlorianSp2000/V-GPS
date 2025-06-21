@@ -5,6 +5,7 @@ import copy
 from functools import partial
 from typing import Optional, Union, Tuple
 import chex
+from absl import logging
 
 import flax
 import flax.linen as nn
@@ -51,7 +52,8 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
         """Forward pass for critic network"""
         if train:
             assert rng is not None, "Must specify rng when training"
-        
+        # logging.info(f"rng passed to forward_critic: {rng}")
+        # logging.info(f"shape of actions: {actions.shape}")
         if jnp.ndim(actions) == 3:
             # 3D case: (batch_size, num_ood_actions, action_dim) used for OOD actions
             q_values = jax.vmap(
@@ -158,7 +160,7 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
             loss_fns[key] = lambda params, rng: (0.0, {})
 
         # Update RNG
-        rng, new_rng = jax.random.split(self.state.rng)
+        rng, new_rng = jax.random.split(self.state.rng) # TODO: check that in update step each ensemble member gets its own rng
         
         # Apply loss functions
         new_state, info = self.state.apply_loss_fns(loss_fns, pmap_axis=pmap_axis, has_aux=True)
@@ -175,12 +177,12 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
         #     if hasattr(opt_state, "hyperparams") and "learning_rate" in opt_state.hyperparams.keys():
         #         info[f"{name}_lr"] = opt_state.hyperparams["learning_rate"]
         
-        return self.replace(state=new_state), info
+        return self.replace(state=new_state), info # TODO: could remove redundant naming in wandb by using info["critic"] and remove nested dict
 
     @jax.jit
     def get_debug_metrics(self, batch, **kwargs):
         """Debug metrics for validation"""
-        rng = jax.random.PRNGKey(0) # TODO: should we use passed rng or a fixed one? For OOD sample eval rng should probably change
+        rng = jax.random.PRNGKey(0) # TODO: should we use passed rng or a fixed one? cql.py also uses PRNGKey(0) here
         
         # Current Q-values
         current_q = self.forward_critic(
@@ -210,11 +212,41 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
             "ood_q": jnp.mean(ood_q),
         }
 
-    def get_q_values(self, observations, goals, actions):
+    def get_q_values(self, observations, goals, actions): # TODO: this method is not used anywhere, but already this way in cql.py
         """Get Q-values for given state-action pairs"""
         obs = (observations, goals) if self.config["goal_conditioned"] else observations
         q_values = self.state.apply_fn({"params": self.state.target_params}, obs, actions, name="critic")
         return jnp.min(q_values, axis=0)  # Take min across ensemble
+
+    def compute_monte_carlo_returns(self, rewards, masks, discount=None):
+        """
+        Compute Monte Carlo returns (reward-to-go) for trajectory using JAX scan.        
+        """
+        if discount is None:
+            discount = self.config.get("discount", 0.98)
+        
+        def scan_fn(carry, inputs):
+            # carry: G_{t+1} (return from future timesteps)
+            # inputs: (reward_t, mask_t)
+            reward_t, mask_t = inputs
+            
+            # G_t = r_t + discount * mask_t * G_{t+1}
+            # Same formula as TD: rewards + discount * masks * next_value
+            monte_carlo_return = reward_t + discount * mask_t * carry
+            
+            return monte_carlo_return, monte_carlo_return
+        
+        # Scan backwards through trajectory
+        rewards_rev = jnp.flip(rewards)
+        masks_rev = jnp.flip(masks)
+        
+        # Initial carry is 0.0 (no future return beyond trajectory)
+        _, returns_rev = jax.lax.scan(scan_fn, 0.0, (rewards_rev, masks_rev))
+        
+        # Flip back to get forward-time order
+        monte_carlo_returns = jnp.flip(returns_rev)
+        
+        return monte_carlo_returns
 
     def get_eval_values(self, traj, seed, goals):
         """Evaluate Q-values over trajectory - FULL VERSION"""
@@ -239,11 +271,15 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
         ood_target_q = self.forward_target_critic(obs, ood_actions, rng)
         ood_target_q_values = jnp.mean(jnp.min(ood_target_q, axis=0), axis=-1)
 
+        # Monte Carlo returns (ground truth Q-function approximation)
+        monte_carlo_returns = self.compute_monte_carlo_returns(traj["rewards"], traj["masks"])
+
         return {
             "q": q_values, 
             "target_q": target_q_values, 
             "q_ood": ood_q_values,
             "target_q_ood": ood_target_q_values, 
+            "q_monte_carlo": monte_carlo_returns,  # Ground truth comparison
             "rewards": traj["rewards"], 
             "masks": traj["masks"],
         }
@@ -253,14 +289,11 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
         full_metrics = self.get_eval_values(traj, seed, goals)
         
         # Return only the subset needed for trajectory metrics
-        subset_keys = ["q", "q_ood"]
+        subset_keys = ["q", "q_ood", "q_monte_carlo"]
         return {k: full_metrics[k] for k in subset_keys if k in full_metrics}
 
     @staticmethod
-    def plot_ensemble_trajectory_values(ensemble_agents, ensemble_size, traj, seeds, goals=None): 
-        """Plot ensemble trajectory metrics - NEW STATIC METHOD"""
-        from absl import logging
-        
+    def adapt_goal_length(goals, traj):
         if goals is None:
             goals = traj["goals"]
         else:
@@ -278,6 +311,13 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
                         elif isinstance(v, list):
                             rep = [v[-1]] * num_repeat
                             goals[k] = v + rep
+        return goals
+
+    @staticmethod
+    def plot_ensemble_trajectory_values(ensemble_agents, ensemble_size, traj, seeds, goals=None): 
+        """Plot ensemble trajectory metrics - NEW STATIC METHOD"""
+        # from absl import logging
+        goals = SARSAEnsembleAgent.adapt_goal_length(goals, traj)
 
         all_member_metrics = []
         
@@ -299,6 +339,19 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
             f"{k}_std": v for k, v in 
             jax.tree_map(lambda *xs: jnp.std(jnp.stack(xs), axis=0), *all_member_metrics).items()
         })        
+        # Compute range (max - min) across ensemble members
+        ensemble_stats.update({
+            f"{k}_range": v for k, v in 
+            jax.tree_map(lambda *xs: jnp.max(jnp.stack(xs), axis=0) - jnp.min(jnp.stack(xs), axis=0), *all_member_metrics).items()
+        })
+        ensemble_stats.update({
+            f"{k}_min": v for k, v in 
+            jax.tree_map(lambda *xs: jnp.min(jnp.stack(xs), axis=0), *all_member_metrics).items()
+        })
+        ensemble_stats.update({
+            f"{k}_max": v for k, v in 
+            jax.tree_map(lambda *xs: jnp.max(jnp.stack(xs), axis=0), *all_member_metrics).items()
+        })
 
         # Create plot
         images = traj["observations"]["image"].squeeze()
@@ -307,26 +360,32 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
         for key in ensemble_stats.keys():
             if key.endswith('_mean'):
                 base_metric = key[:-5]  # Remove '_mean'
-                if f"{base_metric}_std" in ensemble_stats:  # Only if we have both mean and std
+                if f"{base_metric}_std" in ensemble_stats and f"{base_metric}_range" in ensemble_stats:  # Only if we have mean, std, and range
                     base_metrics.append(base_metric)
         base_metrics = sorted(list(set(base_metrics)))
+        if "q_monte_carlo" in base_metrics:
+            base_metrics.remove("q_monte_carlo")
+            base_metrics.append("q_monte_carlo")    # Add it at the end
 
         num_metrics = len(base_metrics) + 2  # +1 for images, +1 for prompt
-
-        # num_metrics = len(ensemble_stats.keys()) + 2  # +1 for images, +1 for prompt
         fig, axs = plt.subplots(num_metrics, 1, figsize=(12, 3 * num_metrics))
         canvas = FigureCanvas(fig)
         
         current_row = 0
         
-        # Plot images
+        # Get trajectory length info
+        full_traj_length = images.shape[0]
         interval = max(1, images.shape[0] // 8)
+        num_images_shown = len(range(0, images.shape[0], interval))
+
+        # Plot images
         sel_images = images[::interval]
         sel_images = np.split(sel_images, sel_images.shape[0], 0)
         sel_images = [a.squeeze() for a in sel_images]
         sel_images = np.concatenate(sel_images, axis=1)
         axs[current_row].imshow(sel_images)
-        axs[current_row].set_title("Trajectory Images")
+        # axs[current_row].set_title("Trajectory Images")
+        axs[current_row].set_title(f"Trajectory Images (showing {num_images_shown}/{full_traj_length} steps, every {interval}th frame)")
         current_row += 1
 
         # Plot prompts
@@ -344,8 +403,12 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
             
             mean_values = ensemble_stats[f"{base_metric}_mean"]
             std_values = ensemble_stats[f"{base_metric}_std"]
-            time_steps = np.arange(len(mean_values))
+            range_values = ensemble_stats[f"{base_metric}_range"]
+            min_values = ensemble_stats[f"{base_metric}_min"]
+            max_values = ensemble_stats[f"{base_metric}_max"]
 
+            time_steps = np.arange(len(mean_values))
+            
             axs[row].plot(time_steps, mean_values, linestyle='-', marker='o', linewidth=2.5, 
                         label=f'{base_metric} mean', color='blue')
             
@@ -356,11 +419,18 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
                                 alpha=0.3, color='blue', label=f'{base_metric} ± std')
             
             # Optional: add std as separate thin lines for reference
-            axs[row].plot(time_steps, mean_values + std_values, '--', alpha=0.4, color='blue', linewidth=1)
-            axs[row].plot(time_steps, mean_values - std_values, '--', alpha=0.4, color='blue', linewidth=1)
+            # axs[row].plot(time_steps, mean_values + std_values, '--', alpha=0.4, color='blue', linewidth=1)
+            # axs[row].plot(time_steps, mean_values - std_values, '--', alpha=0.4, color='blue', linewidth=1)
+            # Show min and max values as dashed lines
+            axs[row].plot(time_steps, max_values, '--', alpha=0.6, color='red', linewidth=1, label=f'{base_metric} max')
+            axs[row].plot(time_steps, min_values, '--', alpha=0.6, color='green', linewidth=1, label=f'{base_metric} min')
             
             axs[row].set_ylabel(base_metric)
-            axs[row].set_title(f"Ensemble {base_metric} (mean ± std, disagreement: {np.mean(std_values):.3f})")
+            title = (f"Ensemble {base_metric}\n"
+                    f"disagreement: mean_std={np.mean(std_values):.3f}, mean_range={np.mean(range_values):.3f}")
+            axs[row].set_title(title)
+
+            # axs[row].set_title(f"Ensemble {base_metric} (mean ± std, disagreement: {np.mean(std_values):.3f})")
             axs[row].grid(True, alpha=0.3)
             axs[row].legend(loc='upper right', fontsize=8)
 
@@ -379,25 +449,9 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
     
     def plot_values(self, traj, seed=None, goals=None):
         """Plot Q-values over trajectory"""
-        from absl import logging
-        if goals is None:
-            goals = traj["goals"]
-        else:
-            # Handle goal length mismatch
-            traj_len = traj["observations"]["image"].shape[0]
-            if goals["language"].shape[0] != traj_len:
-                if goals["language"].shape[0] > traj_len:
-                    goals = {k: v[:traj_len] for k, v in goals.items()}
-                else:
-                    num_repeat = traj_len - goals["language"].shape[0]
-                    for k, v in goals.items():
-                        if hasattr(v, 'shape'):  # JAX array
-                            rep = jnp.repeat(v[-1:], num_repeat, axis=0)
-                            goals[k] = jnp.concatenate([v, rep], axis=0)
-                        elif isinstance(v, list):
-                            rep = [v[-1]] * num_repeat
-                            goals[k] = v + rep
-        
+        # from absl import logging
+        goals = SARSAEnsembleAgent.adapt_goal_length(goals, traj)        
+
         metrics = self.get_eval_values(traj, seed, goals)
         images = traj["observations"]["image"].squeeze()
         
@@ -406,14 +460,18 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
         canvas = FigureCanvas(fig)
         
         current_row = 0
-        # Plot images
+        full_traj_length = images.shape[0]
         interval = max(1, images.shape[0] // 8)
+        num_images_shown = len(range(0, images.shape[0], interval))
+
+        # Plot images
         sel_images = images[::interval]
         sel_images = np.split(sel_images, sel_images.shape[0], 0)
         sel_images = [a.squeeze() for a in sel_images]
         sel_images = np.concatenate(sel_images, axis=1)
         axs[current_row].imshow(sel_images)
-        axs[current_row].set_title("Trajectory Images")
+        # axs[current_row].set_title("Trajectory Images")
+        axs[current_row].set_title(f"Trajectory Images (showing {num_images_shown}/{full_traj_length} steps, every {interval}th frame)")
         current_row += 1
 
         # goals['language_str'] looks something like ['put sweet potato in pot which is in sink', 'put sweet potato in pot which is in sink', 'put .....]
@@ -446,69 +504,6 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
         out_image = out_image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
         plt.close(fig)
         return out_image
-
-    @classmethod
-    def create(cls, rng: PRNGKey, observations: Data, actions: jnp.ndarray, encoder_def: nn.Module,
-               shared_encoder: bool = False, goals: Optional[Data] = None, early_goal_concat: bool = False,
-               shared_goal_encoder: bool = True, language_conditioned: bool = False, goal_conditioned: bool = False,
-               network_kwargs: dict = {"hidden_dims": [256, 256], "activate_final": True, "use_layer_norm": False,},
-               critic_ensemble_size: int = 2, critic_subsample_size: Optional[int] = None, use_min_q: bool = True,
-               num_ood_actions: int = 10, ood_action_sample_method: str = "uniform",
-               learning_rate: float = 3e-4, warmup_steps: int = 1000, discount: float = 0.98,
-               soft_target_update_rate: Optional[float] = None, target_update_rate: Optional[float] = None, **kwargs):
-        """Create SARSA agent"""
-        
-        # Handle naming compatibility
-        if soft_target_update_rate is None and target_update_rate is not None:
-            soft_target_update_rate = target_update_rate
-        elif soft_target_update_rate is None:
-            soft_target_update_rate = 5e-3
-        
-        # Language conditioning requires goal conditioning
-        if language_conditioned:
-            goal_conditioned = True
-        
-        # Create encoder
-        encoder_def = cls._create_encoder_def(
-            encoder_def, use_proprio=False, enable_stacking=False, goal_conditioned=goal_conditioned,
-            early_goal_concat=early_goal_concat, shared_goal_encoder=shared_goal_encoder,
-            language_conditioned=language_conditioned,
-        )
-
-        encoders = {"critic": encoder_def}
-
-        # Create critic network
-        critic_backbone = partial(MLP, **network_kwargs)
-        critic_backbone = ensemblize(critic_backbone, critic_ensemble_size)(name="critic_ensemble")
-        critic_def = partial(Critic, encoder=encoders["critic"], network=critic_backbone)(name="critic")
-
-        networks = {"critic": critic_def}
-        model_def = ModuleDict(networks)
-
-        # Optimizer
-        txs = {"critic": make_optimizer(learning_rate=learning_rate, warmup_steps=warmup_steps)}
-
-        # Initialize parameters
-        rng, init_rng = jax.random.split(rng)
-        network_input = (observations, goals) if goal_conditioned else observations
-        params = model_def.init(init_rng, critic=[network_input, actions])["params"]
-
-        # Create training state
-        rng, create_rng = jax.random.split(rng)
-        state = JaxRLTrainState.create(
-            apply_fn=model_def.apply, params=params, txs=txs, target_params=params, rng=create_rng,
-        )
-
-        # Configuration
-        config = {
-            "critic_ensemble_size": critic_ensemble_size, "critic_subsample_size": critic_subsample_size,
-            "discount": discount, "soft_target_update_rate": soft_target_update_rate,
-            "goal_conditioned": goal_conditioned, "language_conditioned": language_conditioned,
-            "use_min_q": use_min_q, "num_ood_actions": num_ood_actions,
-            "ood_action_sample_method": ood_action_sample_method,
-        }
-
-        return cls(state=state, config=config)
 
     @classmethod
     def _create_encoder_def(cls, encoder_def: nn.Module, use_proprio: bool, enable_stacking: bool,
@@ -567,12 +562,14 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
         Fully vectorized ensemble creation using JAX vmap operations.
         This method creates all ensemble members in parallel, significantly reducing initialization time.
         """
-        
         # Split RNG for all ensemble members at once
+        logging.info(f"base_rng: {base_rng}, ensemble_size: {ensemble_size}")
         agent_rngs = jax.random.split(base_rng, ensemble_size + 1)
+        logging.info(f"agent_rngs: {agent_rngs}")
         init_rngs = agent_rngs[:-1]  # Use first N for initialization
+
         state_rngs = jax.random.split(agent_rngs[-1], ensemble_size)  # Use last for state creation
-        
+        logging.info(f"state_rngs: {state_rngs}")
         # Extract configuration
         goal_conditioned = agent_kwargs.get("goal_conditioned", False)
         language_conditioned = agent_kwargs.get("language_conditioned", False)
@@ -609,7 +606,6 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
 
         # Vectorized parameter initialization - creates all ensemble member parameters in parallel
         ensemble_params = cls._create_single_agent_params(init_rngs, network_input, actions, model_def)
-        
         # Vectorized state creation - creates all training states in parallel
         ensemble_states = cls._create_single_agent_state(state_rngs, ensemble_params, model_def, txs)
 

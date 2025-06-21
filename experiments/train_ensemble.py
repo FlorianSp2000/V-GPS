@@ -32,9 +32,6 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string("name", "", "Experiment name.")
 flags.DEFINE_string("project", "jaxrl_m_bridgedata_ensemble", "WandB project name.")
-# flags.DEFINE_integer("ensemble_size", None, "Number of ensemble members.")
-flags.DEFINE_integer("batch_size_per_member", None, "Batch size per ensemble member.")
-flags.DEFINE_string("batching_method", "reshape", "Ensemble batching method: 'reshape' (recommended) or 'nested'.")
 
 config_flags.DEFINE_config_file("config", None, "Training configuration.", lock_config=False)
 config_flags.DEFINE_config_file("oxedata_config", None, "Data configuration.", lock_config=False)
@@ -80,12 +77,12 @@ def create_ensemble_agents(ensemble_size, rng, template_batch, encoder_def, agen
     return ensemble_agents
 
 
-def get_ensemble_val_batch(val_iterator, ensemble_size):
+def get_ensemble_batch(data_iterator, ensemble_size):
     """
-    Convert single validation batch to ensemble format by duplication.
+    Convert single data  batch to ensemble format by duplication.
     This is much more efficient than multiple iterators.
     """
-    single_batch = next(val_iterator)
+    single_batch = next(data_iterator)
     # Duplicate across ensemble dimension: (batch_size,) → (ensemble_size, batch_size)
     ensemble_batch = jax.tree_map(
         lambda x: jnp.repeat(x[None], ensemble_size, axis=0), 
@@ -119,13 +116,10 @@ def aggregate_ensemble_metrics_cpu(ensemble_metrics):
                 # This is the key metric for OOD detection: disagreement in OOD Q-values
                 flattened[f"ensemble_disagreement_ood_q"] = values
             elif stat_name == 'std' and 'online_q' in metric_name:
-                # This is disagreement in online Q-values
                 flattened[f"ensemble_disagreement_online_q"] = values
             elif stat_name == 'std' and 'target_q' in metric_name:
-                # This is disagreement in target Q-values
                 flattened[f"ensemble_disagreement_target_q"] = values
             else:
-                # Standard naming
                 flattened[f"{stat_name}_{metric_name}"] = values
 
     return flattened
@@ -162,7 +156,6 @@ def batch_log_metrics(wandb_logger, aggregated_metrics, member_metrics_list, ste
             log_dict[f"{prefix}member_{member_idx}_{key}"] = value
             
     # Single wandb call
-    # logging.info(f"log_dict looks: {log_dict}")
     wandb_logger.log(log_dict, step=step)
 
 
@@ -171,9 +164,9 @@ def main(_):
     num_devices = len(devices)
     
     ensemble_size = FLAGS.config.ensemble_size or num_devices
-    batch_size_per_member = FLAGS.batch_size_per_member or (FLAGS.config.batch_size // ensemble_size)
+    batch_size_per_member = FLAGS.config.batch_size // ensemble_size # FLAGS.batch_size_per_member
     
-    logging.info(f"Ensemble training: {ensemble_size} models, {batch_size_per_member} batch size per member")
+    logging.info(f"Ensemble training: {ensemble_size} models, batch size {FLAGS.config.batch_size}, {batch_size_per_member} batch size per member")
     
     tf.config.set_visible_devices([], "GPU")
 
@@ -251,12 +244,6 @@ def main(_):
         oxe_kwargs = FLAGS.oxedata_config["oxe_kwargs"]
         del FLAGS.oxedata_config["oxe_kwargs"]
 
-    # train_data = make_interleaved_dataset_ensemble(
-    #     ensemble_size=ensemble_size,
-    #     batch_size_per_member=batch_size_per_member,
-    #     **dataset_config,
-    #     train=True,
-    # )
     logging.info(f"FLAGS.oxedata_config is {FLAGS.oxedata_config}")
     train_data = make_interleaved_dataset(
         **FLAGS.oxedata_config, train=True
@@ -330,6 +317,7 @@ def main(_):
     
     # Get example batch and create template for agent initialization
     example_batch = next(train_iterator)  # Already ensemble-shaped!
+
     # logging.info(f"example_batch {example_batch}")
     template_batch = jax.tree_map(lambda x: x[0], example_batch)  # Extract single member for template
     
@@ -342,12 +330,14 @@ def main(_):
     # Create ensemble agents
     rng = jax.random.PRNGKey(FLAGS.config.seed)
     agent_class = agents[FLAGS.config.agent]
+    logging.info(f"rng in create_ensemble_agents is {rng}")
     ensemble_agents = create_ensemble_agents(
         ensemble_size, rng, template_batch, encoder_def, agent_class, FLAGS.config.agent_kwargs
     )
 
     # Checkpoint restoration
     if FLAGS.config.resume_path:
+        logging.info("Restoring ensemble agents from checkpoint...")
         restored_agents = []
         for member_idx in range(ensemble_size):
             member_checkpoint_path = os.path.join(FLAGS.config.resume_path, f"ensemble_member_{member_idx}")
@@ -359,6 +349,9 @@ def main(_):
                 agent = jax.tree_map(lambda x: x[member_idx], ensemble_agents)
             restored_agents.append(agent)
         ensemble_agents = jax.tree_map(lambda *args: jnp.stack(args, axis=0), *restored_agents)
+        logging.info(f"RESTORATION: ensemble_agents shape: {jax.tree_map(lambda x: x.shape, ensemble_agents)}")
+        # member_agent = jax.tree_map(lambda x: x[0], ensemble_agents)
+        # logging.info(f"Single member agent state shape: {jax.tree_map(lambda x: x.shape, member_agent)}")
 
     # Create pmapped functions for cross-device parallelization
     pmapped_update = jax.pmap(lambda agent, batch: agent.update(batch))
@@ -366,7 +359,6 @@ def main(_):
 
     timer = Timer()
     
-    # Training loop - much cleaner now!
     for i in tqdm.tqdm(range(int(FLAGS.config.num_steps))):
         timer.tick("total")
 
@@ -381,28 +373,46 @@ def main(_):
 
         timer.tock("train")
 
-        if (i + 1) % FLAGS.config.eval_interval == 0:
+        if i % FLAGS.config.eval_interval == 0: # TODO: removed +1 to check initialization
             logging.info("Evaluating ensemble...")
             timer.tick("val")
             
-            # Validation evaluation - much simpler now
+            # Validation evaluation
             val_metrics_list = []
+            noise_metrics_list = []  # Collect noise metrics over 8 iterations
             for _ in range(8):
                 # Get ensemble validation batch by duplicating single batch
-                ensemble_val_batch = get_ensemble_val_batch(val_iter, ensemble_size)
+                ensemble_val_batch = get_ensemble_batch(val_iter, ensemble_size)
                 rng, val_rng = jax.random.split(rng)
                 val_rngs = jax.random.split(val_rng, ensemble_size)
+                # sanity check
+                noise_batch = jax.tree_map(lambda x: x, ensemble_val_batch)  # Deep copy
+                noise_batch["observations"]["image"] = jax.random.normal(rng, noise_batch["observations"]["image"].shape)
+                
+                noise_metrics = pmapped_debug_metrics(ensemble_agents, noise_batch, val_rngs)
                 val_metrics = pmapped_debug_metrics(ensemble_agents, ensemble_val_batch, val_rngs)
+
                 val_metrics_list.append(val_metrics)
+                noise_metrics_list.append(noise_metrics)
             
             # Compute validation statistics (this happens on CPU after device_get)
+            # average over 8 iterations
             avg_val_metrics = jax.tree_map(lambda *xs: jnp.mean(jnp.stack(xs), axis=0), *val_metrics_list)
+            avg_noise_metrics = jax.tree_map(lambda *xs: jnp.mean(jnp.stack(xs), axis=0), *noise_metrics_list)
 
             # Move to CPU for aggregation
             avg_val_metrics_cpu = jax.device_get(avg_val_metrics)
-            # logging.info(f"avg_val_metrics_cpu looks: {avg_val_metrics_cpu}")
+            avg_noise_metrics_cpu = jax.device_get(avg_noise_metrics)
+            # Compute aggregated disagreement levels
+            real_disagreement = jnp.mean(jnp.std(avg_val_metrics_cpu["online_q"], axis=0))
+            noise_disagreement = jnp.mean(jnp.std(avg_noise_metrics_cpu["online_q"], axis=0))
+            logging.info(f"Aggregated real data disagreement (8 iterations): {real_disagreement:.3f}")
+            logging.info(f"Aggregated noise data disagreement (8 iterations): {noise_disagreement:.3f}")
+
             # CPU-based aggregation and member extraction
             aggregated_val_metrics = aggregate_ensemble_metrics_cpu(avg_val_metrics_cpu)
+            # aggregated_val_metrics["ensemble_obs_noise_disagreement"] = noise_disagreement
+            aggregated_val_metrics["ensemble_disagreement_obs_noise_ratio"] = noise_disagreement / (real_disagreement + 1e-8)  # Avoid division by zero
             member_val_metrics = prepare_member_metrics_cpu(avg_val_metrics_cpu, ensemble_size)
             
             batch_log_metrics(wandb_logger, aggregated_val_metrics, member_val_metrics, i, "validation/")
@@ -410,7 +420,7 @@ def main(_):
             if val_data_fractal_iter is not None:
                 val_metrics_list = []
                 for _ in range(8):
-                    ensemble_val_batch = get_ensemble_val_batch(val_data_fractal_iter, ensemble_size)
+                    ensemble_val_batch = get_ensemble_batch(val_data_fractal_iter, ensemble_size)
                     rng, val_rng = jax.random.split(rng)
                     val_rngs = jax.random.split(val_rng, ensemble_size)
                     val_metrics = pmapped_debug_metrics(ensemble_agents, ensemble_val_batch, val_rngs)
@@ -429,8 +439,8 @@ def main(_):
             if "sarsa" in FLAGS.config.agent:
                 logging.info("Plotting value functions...")
                 for num in range(2):
-                    for member_idx in range(min(1, ensemble_size)):
-                        traj = next(val_traj_data_iter)
+                    traj = next(val_traj_data_iter)
+                    for member_idx in range(min(2, ensemble_size)):
                         rng, val_rng = jax.random.split(rng)
                         
                         single_agent = jax.tree_map(lambda x: x[member_idx], ensemble_agents)
@@ -466,8 +476,8 @@ def main(_):
                 if val_data_fractal_iter is not None:
                     logging.info("Plotting value functions for fractal..")
                     for num in range(2):
-                        for member_idx in range(min(1, ensemble_size)):
-                            traj = next(val_traj_data_fractal_iter)
+                        traj = next(val_traj_data_fractal_iter)
+                        for member_idx in range(min(2, ensemble_size)):
                             rng, val_rng = jax.random.split(rng)
 
                             single_agent = jax.tree_map(lambda x: x[member_idx], ensemble_agents)
