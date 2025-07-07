@@ -21,7 +21,7 @@ from jaxrl_m.data.text_processing import text_processors
 import wandb
 from jax.experimental.compilation_cache import compilation_cache
 
-from octo.data.dataset import make_interleaved_dataset_ensemble, make_interleaved_dataset
+from octo.data.dataset import make_interleaved_dataset
 from octo.data.oxe import make_oxe_dataset_kwargs_and_weights
 from octo.utils.train_callbacks import create_validation_dataset
 from octo.utils.train_utils import filter_eval_datasets
@@ -128,6 +128,7 @@ def aggregate_ensemble_metrics_cpu(ensemble_metrics):
 def prepare_member_metrics_cpu(ensemble_metrics, ensemble_size):
     """
     Extract individual member metrics on CPU.
+    
     """
     member_metrics_list = []
     for member_idx in range(ensemble_size):
@@ -165,6 +166,7 @@ def main(_):
     
     ensemble_size = FLAGS.config.ensemble_size or num_devices
     batch_size_per_member = FLAGS.config.batch_size // ensemble_size # FLAGS.batch_size_per_member
+    # batch_size_per_member = FLAGS.config.batch_size # FLAGS.batch_size_per_member
     
     logging.info(f"Ensemble training: {ensemble_size} models, batch size {FLAGS.config.batch_size}, {batch_size_per_member} batch size per member")
     
@@ -385,7 +387,7 @@ def main(_):
                 ensemble_val_batch = get_ensemble_batch(val_iter, ensemble_size)
                 rng, val_rng = jax.random.split(rng)
                 val_rngs = jax.random.split(val_rng, ensemble_size)
-                # sanity check
+                # sanity check: compute disagreement with noise observations
                 noise_batch = jax.tree_map(lambda x: x, ensemble_val_batch)  # Deep copy
                 noise_batch["observations"]["image"] = jax.random.normal(rng, noise_batch["observations"]["image"].shape)
                 
