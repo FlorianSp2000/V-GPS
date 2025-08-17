@@ -9,6 +9,9 @@ from ml_collections import ConfigDict
 from octo.data.oxe import make_oxe_dataset_kwargs_and_weights
 from octo.utils.train_utils import filter_eval_datasets
 from octo.utils.train_callbacks import create_validation_dataset
+import tensorflow as tf
+import os
+from utils.constants import ENSEMBLE_MODEL_PATH
 
 def load_configs_for_jupyter(algorithm="ensemble_sarsa", 
                            data_dir="/V-GPS/datasets/open_x", 
@@ -65,22 +68,95 @@ def load_configs_for_jupyter(algorithm="ensemble_sarsa",
         
     return train_config, data_config
 
+def _get_full_dataset_name(short_name: str) -> str:
+    """Convert short name to full dataset name for filtering."""
+    name_mapping = {
+        "bridge": "bridge_dataset",
+        "fractal": "fractal20220817_data"
+    }
+    return name_mapping.get(short_name, short_name)
 
-def extract_trajectory_data(dataset_name: str, max_trajectories: int = None, keep_full_trajectory=False, keep_raw_instruction=False,
-                                save_trajectories: bool = False, save_path: str = None, save_format: str = "pkl"):
-    """Extract trajectory data efficiently from oxe dataset. 
+def _extract_from_single_dataset(val_data, dataset_name, max_count, 
+                                keep_full_trajectory, keep_raw_instruction, skip_missing_instruction: bool = True):
+    """Extract trajectories from a single dataset."""
+    # Create trajectory iterator
+    val_traj_iter = val_data.iterator()
+    trajectories = []
+    print(f"Extracting trajectories from {dataset_name}...")
+    print(f"Keep full trajectory: {keep_full_trajectory}")
     
+    valid_traj_count = 0  # Count only valid trajectories
+    total_processed = 0   # Count all processed trajectories
+
+    for batch in val_traj_iter:
+        if max_count and valid_traj_count >= max_count:
+            break            
+        # if skip_missing_instruction
+        total_processed += 1
+        images = batch["observation"]["image_primary"].squeeze()  # Shape: (traj_len, 1, 256, 256, 3)
+        language_raw = batch["task"]["language_instruction"]  # Shape: (traj_len,) of bytes
+        actions = batch['action'].squeeze()
+        next_actions = batch['next_action'].squeeze() 
+
+        # Take first language instruction and decode from bytes
+        language = language_raw[0].decode("utf-8")
+        if skip_missing_instruction and len(language.strip()) == 0:
+            if total_processed % 100 == 0:
+                print(f"  Processed {total_processed}, found {valid_traj_count} valid trajectories (skipped empty instruction)")
+            continue
+
+        trajectory_data = {
+            'first_image': np.array(images[0]),
+            'last_image': np.array(images[-1]),
+            'first_action': np.array(actions[0]),
+            'last_action': np.array(actions[-1]),
+            'first_next_action': np.array(next_actions[0]),
+            'last_next_action': np.array(next_actions[-1]),
+            'language': language,
+            'dataset': dataset_name,  # Short name (bridge/fractal)
+            'traj_length': int(images.shape[0]),
+            'trajectory_id': valid_traj_count,  # Local ID per dataset
+            'action': np.array(actions)
+        }
+        
+        if keep_raw_instruction:
+            trajectory_data["language_bytes"] = language_raw
+        # Optionally keep full trajectory
+        if keep_full_trajectory:
+            trajectory_data.update({
+                'images': images,
+                'next_actions': np.array(next_actions)
+            })
+        trajectories.append(trajectory_data)
+
+        valid_traj_count += 1
+    
+    print(f"  Final: {valid_traj_count} valid trajectories from {total_processed} total processed")   
+    return trajectories
+
+def extract_trajectory_data(dataset_name: str, max_trajectories: int = None, 
+                           keep_full_trajectory=False, keep_raw_instruction=False,
+                           save_trajectories: bool = False, save_path: str = None, 
+                           save_format: str = "pkl", mix_ratio: dict = None,
+                           seed: int = 44, skip_missing_instruction: bool = True):
+    """
+    Extract trajectory data from single or mixed OXE datasets with deterministic ordering.
+        
     Uses Octo tools to create validation set of trajectories of Bridge or Fractal dataset.
 
     Args:
-        dataset_name: "bridge" or "fractal"
-        max_trajectories: Max number to extract, None for all; Bridge Validation set is ~7k
+        :param dataset_name: "bridge", "fractal", or "bridge_fractal" for mixed
+        :param max_trajectories: Max trajectories to extract. Set None for all; Bridge Validation set is ~7k
         keep_full_trajectory: If True, also keep full trajectory (memory intensive)
         save_trajectories: If True, save extracted data to disk for diffusion pipeline
         save_path: Path to save file (auto-generated if None)
         save_format: "pkl" 
+        :param mix_ratio: Dict like {"bridge": 0.6, "fractal": 0.4} for custom mixing
+        :param seed: Random seed for deterministic ordering
     """
-    
+    tf.random.set_seed(seed) # make sure TensorFlow is deterministic
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+
     # FLAGS = create_config()
     # oxe_config = create_oxe_config()
     # TODO: Load configs e.g. from files instead of creating them here
@@ -89,90 +165,65 @@ def extract_trajectory_data(dataset_name: str, max_trajectories: int = None, kee
         data_dir="/V-GPS/datasets/open_x",
         batch_size=1024,
         ensemble_size=8,
-        seed=44,
-        resume_path="/V-GPS/results/VGPS_ensemble/VGPS_ensemble_sarsa_bridge_fractal_ens8_b1024s44_20250606_164313"
+        seed=seed,
+        resume_path=ENSEMBLE_MODEL_PATH
     )
     
     # Create dataset kwargs
     (dataset_kwargs_list, sample_weights) = make_oxe_dataset_kwargs_and_weights(**oxe_config["oxe_kwargs"])
         
     # Filter for specific dataset
-    if dataset_name == "bridge":
-        filter_names = ["bridge_dataset"]
-    elif dataset_name == "fractal":
-        filter_names = ["fractal20220817_data"]
+    if dataset_name == "bridge_fractal":
+        datasets_to_process = ["bridge", "fractal"]
+        if mix_ratio is None:
+            mix_ratio = {"bridge": 0.5, "fractal": 0.5}  # Default 50/50
+    elif dataset_name in ["bridge", "fractal"]:
+        datasets_to_process = [dataset_name]
+        mix_ratio = {dataset_name: 1.0}
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
     
-    val_datasets_kwargs_list, _ = filter_eval_datasets(dataset_kwargs_list, sample_weights, filter_names)
-    
-    # Create validation dataset
-    val_data = create_validation_dataset(
-        val_datasets_kwargs_list[0],
-        oxe_config["traj_transform_kwargs"],
-        oxe_config["frame_transform_kwargs"],
-        train=False
-    )
-    
-    # Create trajectory iterator
-    val_traj_iter = val_data.iterator()
-    
-    trajectories = []
-    print(f"Extracting trajectories from {dataset_name}...")
-    print(f"Keep full trajectory: {keep_full_trajectory}")
-    
-    for i, batch in enumerate(val_traj_iter):
-        if max_trajectories is not None and i >= max_trajectories:
-            break
+    all_trajectories = []
+
+    for dataset_short_name in datasets_to_process:
+        print(f"Processing {dataset_short_name} dataset...")
+        
+        # Map short name to full dataset name for filtering
+        filter_name = _get_full_dataset_name(dataset_short_name)
+        val_datasets_kwargs_list, _ = filter_eval_datasets(dataset_kwargs_list, sample_weights, [filter_name])
+        
+        if not val_datasets_kwargs_list:
+            print(f"Warning: No data found for {dataset_short_name}")
+            continue
             
-        images = batch["observation"]["image_primary"].squeeze()  # Shape: (traj_len, 1, 256, 256, 3)
-        language_raw = batch["task"]["language_instruction"]  # Shape: (traj_len,) of bytes
-        actions = batch['action'].squeeze()
-        next_actions = batch['next_action'].squeeze() 
-
-        # Take first language instruction and decode from bytes
-        language = language_raw[0].decode("utf-8")
+        # Calculate how many trajectories to extract from this dataset
+        expected_count = int(max_trajectories * mix_ratio.get(dataset_short_name, 0)) if max_trajectories else None
+        print(f"Target trajectories for {dataset_short_name}: {expected_count}")
         
-        # Extract first and last images efficiently
-        first_image = images[0]   # Shape: (1, 256, 256, 3)
-        last_image = images[-1]   # Shape: (1, 256, 256, 3)
-        first_action, last_action = actions[0], actions[-1]
-        first_next_action, last_next_action = next_actions[0], next_actions[-1]
-
-        trajectory_data = {
-            'first_image': np.array(first_image),
-            'last_image': np.array(last_image),
-            'first_action': np.array(first_action),
-            'last_action': np.array(last_action),
-            'first_next_action': np.array(first_next_action),
-            'last_next_action': np.array(last_next_action),
-            'language': language,
-            'dataset': dataset_name,
-            'traj_length': int(images.shape[0]),
-            'trajectory_id': i,
-            'action': np.array(actions)
-        }
+        val_data = create_validation_dataset(
+            val_datasets_kwargs_list[0],
+            oxe_config["traj_transform_kwargs"],
+            oxe_config["frame_transform_kwargs"],
+            train=False
+        )
         
-        if keep_raw_instruction:
-            trajectory_data["language_bytes"] = language_raw
-        # Optionally keep full trajectory
-        if keep_full_trajectory:
-            trajectory_data['images'] = images
-            trajectory_data['next_actions'] = np.array(next_actions)
-
-        trajectories.append(trajectory_data)
+        # Extract trajectories from this dataset
+        dataset_trajectories = _extract_from_single_dataset(
+            val_data, dataset_short_name, expected_count, 
+            keep_full_trajectory, keep_raw_instruction, skip_missing_instruction=skip_missing_instruction
+        )
         
-        if (i + 1) % 1000 == 0:
-            print(f"Extracted {i + 1} trajectories...")
+        all_trajectories.extend(dataset_trajectories)
+        print(f"Extracted {len(dataset_trajectories)} trajectories from {dataset_short_name}")
     
-    print(f"Extracted {len(trajectories)} trajectories from {dataset_name}")
+    print(f"Total extracted: {len(all_trajectories)} trajectories from {dataset_name}")
+        
     # Save for PyTorch diffusion pipeline if requested
     if save_trajectories:
         # Auto-generate save path if not provided
         if save_path is None:
-            trajectory_count = len(trajectories)
-            max_str = f"_max{max_trajectories}" if max_trajectories else "_all"
-            save_path = f"{dataset_name}_trajectories{max_str}_n{trajectory_count}.pkl"
+            num_tra_str = f"_n{max_trajectories}" if max_trajectories else "_all"
+            save_path = f"data/{dataset_name}_{num_tra_str}.pkl"
         elif not save_path.endswith('.pkl'):
             save_path += '.pkl'
         
@@ -180,17 +231,18 @@ def extract_trajectory_data(dataset_name: str, max_trajectories: int = None, kee
         save_dir = Path(save_path).parent
         save_dir.mkdir(parents=True, exist_ok=True)
         
-        print(f"Saving {len(trajectories)} trajectories to {save_path}...")
+        print(f"Saving {len(all_trajectories)} trajectories to {save_path}...")
         
         # Prepare data with metadata
         save_data = {
-            'trajectories': trajectories,
+            'trajectories': all_trajectories,
             'metadata': {
                 'dataset_name': dataset_name,
-                'num_trajectories': len(trajectories),
-                'image_shape': trajectories[0]['first_image'].shape if trajectories else None,
-                'action_shape': trajectories[0]['first_action'].shape if trajectories else None,
-                'format_version': '1.0',
+                'num_trajectories': len(all_trajectories),
+                'dataset_distribution': mix_ratio,
+                'image_shape': all_trajectories[0]['first_image'].shape if all_trajectories else None,
+                'action_shape': all_trajectories[0]['first_action'].shape if all_trajectories else None,
+                'format_version': '1.1',
                 'created_for': 'pytorch_diffusion_pipeline'
             }
         }
@@ -199,7 +251,7 @@ def extract_trajectory_data(dataset_name: str, max_trajectories: int = None, kee
             pickle.dump(save_data, f)
         print(f"Saved to: {save_path}")
 
-    return trajectories
+    return all_trajectories
 
 """
 Example Usage
@@ -214,7 +266,141 @@ bridge_trajectories_for_diffusion = extract_trajectory_data(
     save_trajectories=True,  # Enable saving
     save_path=f"data/{dataset_name}_diffusion_dataset_traj{num_traj}"  # Custom path
 )
+# or
+traj = extract_trajectory_data("bridge_fractal", max_trajectories=300, save_trajectories=True)
 """
+
+def _save_image_with_timestamp(img_array, filepath, timestamp):
+    """Save image with specific timestamp in EXIF data."""
+    # Convert numpy array to PIL Image
+    img = Image.fromarray(img_array)
+    
+    try:
+        import piexif
+        
+        # Create EXIF data with correct timestamp tags
+        exif_dict = {
+            "0th": {
+                piexif.ImageIFD.DateTime: timestamp.strftime("%Y:%m:%d %H:%M:%S"),
+            },
+            "Exif": {
+                piexif.ExifIFD.DateTimeOriginal: timestamp.strftime("%Y:%m:%d %H:%M:%S"),
+                piexif.ExifIFD.DateTimeDigitized: timestamp.strftime("%Y:%m:%d %H:%M:%S"),
+            },
+            "GPS": {},
+            "1st": {},
+            "thumbnail": None
+        }
+        
+        # Convert to piexif format and save
+        exif_bytes = piexif.dump(exif_dict)
+        img.save(filepath, exif=exif_bytes)
+        
+    except ImportError:
+        print("Warning: piexif not installed, saving without EXIF timestamp")
+        print("Install with: pip install piexif")
+        img.save(filepath)
+        
+        # Fallback: set file modification time
+        import os
+        timestamp_epoch = timestamp.timestamp()
+        os.utime(filepath, (timestamp_epoch, timestamp_epoch))
+        
+    except Exception as e:
+        print(f"Warning: Could not set EXIF timestamp: {e}")
+        img.save(filepath)
+        
+        # Fallback: set file modification time
+        import os
+        timestamp_epoch = timestamp.timestamp()
+        os.utime(filepath, (timestamp_epoch, timestamp_epoch))
+
+def extract_trajectory_images(trajectories, output_dir="data/trajectory_images", base_timestamp=None):
+    """
+    Extract first and last images from trajectories and save as PNGs with ordered timestamps.
+    
+    :param trajectories: List of trajectory dictionaries
+    :param output_dir: Directory to save images
+    :param base_timestamp: Starting timestamp (datetime), defaults to now
+    :returns: Number of images saved
+    """
+    from PIL import Image
+    from PIL.ExifTags import IFD, TAGS
+    from datetime import datetime, timedelta
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    if base_timestamp is None:
+        base_timestamp = datetime(2025, 1, 1, 12, 0, 0)  # Fixed base date for consistency
+    
+    image_count = 0
+    current_time = base_timestamp
+    
+    # Sort trajectories: bridge first, then fractal, by trajectory_id within each dataset
+    sorted_trajs = sorted(trajectories, key=lambda x: (x['dataset'], x['trajectory_id']))
+    
+    for traj in sorted_trajs:
+        dataset = traj['dataset']
+        traj_id = traj['trajectory_id']
+        
+        # Save first image with timestamp
+        first_img = traj['first_image']
+        if first_img.dtype != np.uint8:
+            first_img = (first_img * 255).astype(np.uint8)
+        
+        first_filename = f"first_image_{dataset}_{traj_id}.png"
+        first_path = output_path / first_filename
+        _save_image_with_timestamp(first_img, first_path, current_time)
+        current_time += timedelta(minutes=1)  # Increment by 1 minute
+        
+        # Save last image with timestamp
+        last_img = traj['last_image']
+        if last_img.dtype != np.uint8:
+            last_img = (last_img * 255).astype(np.uint8)
+            
+        last_filename = f"last_image_{dataset}_{traj_id}.png"
+        last_path = output_path / last_filename
+        _save_image_with_timestamp(last_img, last_path, current_time)
+        current_time += timedelta(minutes=1)  # Increment by 1 minute
+        
+        image_count += 2
+    
+    print(f"Saved {image_count} images with ordered timestamps to {output_path}")
+    print(f"Order: first_image_0, last_image_0, first_image_1, last_image_1, ...")
+    print(f"Datasets ordered: bridge first, then fractal")
+
+
+def load_edited_images_back(trajectories, images_dir="trajectory_images"):
+    """
+    Load edited images back into trajectory data structure.
+    
+    :param trajectories: Original trajectory list
+    :param images_dir: Directory containing edited images
+    :returns: Updated trajectory list with edited images
+    """
+    images_path = Path(images_dir)
+    
+    for traj in trajectories:
+        dataset = traj['dataset'] 
+        traj_id = traj['trajectory_id']
+        
+        # Load edited first image
+        first_filename = f"first_image_{dataset}_{traj_id}.png"
+        first_path = images_path / first_filename
+        if first_path.exists():
+            edited_first = np.array(Image.open(first_path))
+            traj['first_image_inpainted'] = edited_first
+        
+        # Load edited last image
+        last_filename = f"last_image_{dataset}_{traj_id}.png"
+        last_path = images_path / last_filename
+        if last_path.exists():
+            edited_last = np.array(Image.open(last_path))
+            traj['last_image_inpainted'] = edited_last
+    
+    print(f"Loaded edited images from {images_path}")
+    return trajectories
 
 
 def create_inpaintings_from_mask(data: dict, diffusion_pipeline, out_h: int= 1024, out_w: int = 1024, max_seq_len: int =512, save_path: str = None):

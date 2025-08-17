@@ -11,11 +11,15 @@ def get_config(config_string):
         num_steps=int(1e6),
         log_interval=1000,
         eval_interval=20000,
-        save_interval=100000,
+        save_interval=50000,
         save_dir=placeholder(str),
         resume_path="",
+        resume_wandb_id=placeholder(str),
         seed=42,
         ensemble_size=8,  # Number of ensembles
+        create_negative_demos=False, # Include Trajectories with non-matching language prompts
+        negative_demo_ratio=0.05,
+        exclude_empty_lang_instr=False,  # Exclude empty language instructions from training
     )
 
     possible_structures = {

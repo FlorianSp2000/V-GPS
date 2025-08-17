@@ -196,7 +196,7 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
             batch["next_actions"], rng=rng,
         )
         
-        # OOD Q-values evaluation
+        # Action OOD Q-values evaluation
         rng, ood_rng = jax.random.split(rng)
         ood_actions = self._sample_ood_actions(batch, ood_rng, num_ood_actions=self.config.get("num_ood_actions", 10))
         ood_q = self.forward_critic(
@@ -208,7 +208,7 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
             "online_q": jnp.mean(current_q),
             "target_q": jnp.mean(target_q),
             # "q_std": jnp.std(current_q), check if needed
-            "rewards": jnp.mean(batch["rewards"]), # add averaging here - for some reason in original script this was done implicitly while averaging over multiple iterations
+            "rewards": jnp.mean(batch["rewards"]), # added averaging here - for some reason in original script this was done implicitly while averaging over multiple iterations
             "ood_q": jnp.mean(ood_q),
         }
 
@@ -317,6 +317,7 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
     def plot_ensemble_trajectory_values(ensemble_agents, ensemble_size, traj, seeds, goals=None): 
         """Plot ensemble trajectory metrics - NEW STATIC METHOD"""
         # from absl import logging
+        using_random_goals = goals is not None
         goals = SARSAEnsembleAgent.adapt_goal_length(goals, traj)
 
         all_member_metrics = []
@@ -364,11 +365,13 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
                     base_metrics.append(base_metric)
         base_metrics = sorted(list(set(base_metrics)))
         if "q_monte_carlo" in base_metrics:
-            base_metrics.remove("q_monte_carlo")
-            base_metrics.append("q_monte_carlo")    # Add it at the end
+                base_metrics.remove("q_monte_carlo")
+                # Only show q_monte_carlo if not using random goals because reward structure should change
+                if not using_random_goals:
+                    base_metrics.append("q_monte_carlo")    # Hack to change order and add it at the end
 
         num_metrics = len(base_metrics) + 2  # +1 for images, +1 for prompt
-        fig, axs = plt.subplots(num_metrics, 1, figsize=(12, 3 * num_metrics))
+        fig, axs = plt.subplots(num_metrics, 1, figsize=(14, 3 * num_metrics)) # previously (14, ...)
         canvas = FigureCanvas(fig)
         
         current_row = 0
@@ -391,8 +394,11 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
         # Plot prompts
         if "language_str" in goals:
             unique_prompts = set(goals["language_str"])
-            axs[current_row].text(0.5, 0.5, "\n".join(unique_prompts), fontsize=10, ha='center', va='center')
-            axs[current_row].set_title("Prompts")
+            axs[current_row].text(0.5, 0.5, "\n".join(unique_prompts), fontsize=12, ha='center', va='center')
+            if using_random_goals:
+                axs[current_row].set_title("Prompts (Random Goals)")
+            else:
+                axs[current_row].set_title("Prompts")
             axs[current_row].axis('off')
             current_row += 1
 
@@ -562,6 +568,7 @@ class SARSAEnsembleAgent(flax.struct.PyTreeNode):
         Fully vectorized ensemble creation using JAX vmap operations.
         This method creates all ensemble members in parallel, significantly reducing initialization time.
         """
+        # from absl import logging
         # Split RNG for all ensemble members at once
         logging.info(f"base_rng: {base_rng}, ensemble_size: {ensemble_size}")
         agent_rngs = jax.random.split(base_rng, ensemble_size + 1)

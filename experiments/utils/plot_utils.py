@@ -8,6 +8,7 @@ def plot_inpainting_results(data: dict, samples_per_category: int = 5, figsize: 
     """
     Takes dictionary of robot trajectories with 'first_image', 'last_image' and corresponding inpainting results + OOD Category.
     This plot function visualizes the inpainting results for each trajectory.
+    This function was used when using custom mask creation editor for inpaintings.
     It shows the first and last images, their inpainted versions, the original language instruction,
     and the inpainting prompt, all organized by OOD category.
     

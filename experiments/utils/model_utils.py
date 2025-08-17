@@ -68,23 +68,7 @@ def create_ensemble_agents(ensemble_size, rng, template_batch, encoder_def, agen
         )
     else:
         print("Using standard ensemble agent creation")
-        raise ValueError('used second branch')
-        # agent_rngs = jax.random.split(rng, ensemble_size)
-        
-        # agents_list = []
-        # for member_idx, agent_rng in enumerate(agent_rngs):
-        #     agent = agent_class.create(
-        #         rng=agent_rng,
-        #         observations=template_batch["observations"],
-        #         goals=template_batch["goals"],
-        #         actions=template_batch["actions"],
-        #         encoder_def=encoder_def,
-        #         **agent_kwargs,
-        #     )
-        #     agents_list.append(agent)
-        
-        # # Stack into ensemble structure for pmap
-        # ensemble_agents = jax.tree_map(lambda *args: jnp.stack(args, axis=0), *agents_list)
+        raise ValueError('create_ensemble_vectorized not implemented for this agent class')
     
     return ensemble_agents
 
@@ -162,7 +146,7 @@ def load_ensemble_agent(resume_path: str, config: ConfigDict, data_mix: str = "b
     print("Ensemble loading complete!")
     return ensemble_agents, train_iterator
 
-@partial(jax.vmap, in_axes=(0, None, 0)) # will use broadcasting
+@partial(jax.vmap, in_axes=(0, None, 0)) # will use broadcasting TODO: test equivalence with 0,0,0 and duplicating
 def _ensemble_forward_critic(agent, batch, rng_key):
     """Vectorized critic forward pass across ensemble members on same batch.
     Efficient when evaluating ensemble on same batch; If each agent should see different batches use in_axes(0,0,0) which
@@ -182,8 +166,8 @@ def compute_ensemble_uncertainty(ensemble_agent, batch, ensemble_size=8):
     rng = jax.random.PRNGKey(0) # TODO: should we use passed rng or a fixed one? cql.py also uses PRNGKey(0) here
     val_rngs = jax.random.split(rng, ensemble_size)
     q_values = _ensemble_forward_critic(ensemble_agent, batch, val_rngs)
-    assert jnp.ndim(q_values) == 3
-    disagreement = jnp.std(jnp.mean(q_values, axis=[1,2])) # We get back (ensemble_size, 2, batch_size) where I assume 2 is from number of critic networks
+    assert jnp.ndim(q_values) == 3 # We get back (ensemble_size, 2, batch_size) where I assume 2 is from number of critic networks
+    disagreement = jnp.std(jnp.mean(q_values, axis=[1,2])) 
     return disagreement
 """
 Example Computation
