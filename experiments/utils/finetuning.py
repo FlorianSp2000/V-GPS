@@ -1,7 +1,12 @@
 import dlimp as dl
 import tensorflow as tf
 
-def create_negative_demonstrations(dataset: dl.DLataset, negative_ratio: float = 0.05, seed: int = 42, prompt_pool_size: int = 10_000):
+def create_negative_demonstrations(dataset: dl.DLataset, 
+    negative_ratio: float = 0.05, 
+    seed: int = 42, 
+    prompt_pool_size: int = 10_000,
+    use_bootstrap=True,
+    ):
     """
     Takes a dlimp dataset of non-flattened, consistent trajectories.
     Add negative demonstrations by modifying language prompts and rewards for a percentage of trajectories.
@@ -10,6 +15,7 @@ def create_negative_demonstrations(dataset: dl.DLataset, negative_ratio: float =
     :param dataset: DLataset containing trajectories
     :param negative_ratio: Fraction of trajectories to convert to negative demos (e.g., 0.05 for 5%)
     :param seed: Random seed for reproducible sampling
+    :param use_bootstrap: If True, set td_mask to all ones for negative demos
     :returns: Dataset with negative demonstrations added
     """
     
@@ -29,8 +35,8 @@ def create_negative_demonstrations(dataset: dl.DLataset, negative_ratio: float =
     print(f"Collected {len(unique_prompts)} unique language prompts")
     
     # Set up random selection for negative demos
-    tf.random.set_seed(seed)
-    
+    tf.random.set_seed(seed) # TODO: Probably better to not set global seed here
+
     def modify_trajectory(traj):
         """Randomly decide whether to convert trajectory to negative demo."""
         
@@ -54,7 +60,9 @@ def create_negative_demonstrations(dataset: dl.DLataset, negative_ratio: float =
             
             # Set ALL rewards to -1 (negative demonstration)
             modified_example['reward'] = tf.ones_like(traj['reward']) * -1
-            
+            if use_bootstrap:
+                modified_example['td_mask'] = tf.ones_like(traj['reward']) # instead of 1,1,...,0,0,0
+            # TODO: This lets 'mc_return' that is computed in make_dataset_from_rlds become invalid 
             return modified_example
         
         def keep_original():
