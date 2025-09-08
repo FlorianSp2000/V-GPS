@@ -110,7 +110,7 @@ def load_ensemble_agent(resume_path: str, config: ConfigDict, data_mix: str = "b
     
     # Create iterator and get example batch
     train_iterator = map(partial(process_oxe_batch, training=True, 
-    text_processor=text_processor, ensemble_size=ensemble_size, batch_size_per_member=batch_size_per_member), train_data.iterator(prefetch=0))
+        text_processor=text_processor, ensemble_size=ensemble_size, batch_size_per_member=batch_size_per_member), train_data.iterator(prefetch=0))
 
     example_batch = next(train_iterator)  # Already ensemble-shaped because of process_oxe_batch's reshape !
     template_batch = jax.tree_map(lambda x: x[0], example_batch)  # Extract single member for template
@@ -167,9 +167,10 @@ def compute_ensemble_uncertainty(ensemble_agent, batch, ensemble_size=8):
     val_rngs = jax.random.split(rng, ensemble_size)
     q_values = _ensemble_forward_critic(ensemble_agent, batch, val_rngs)
     assert jnp.ndim(q_values) == 3 # We get back (ensemble_size, 2, batch_size) where I assume 2 is from number of critic networks
-    disagreement = jnp.std(jnp.mean(q_values, axis=[1,2])) 
-    return disagreement
+    mean_q_value_per_member = jnp.mean(q_values, axis=[1,2])
+    disagreement = jnp.std(mean_q_value_per_member) 
+    return disagreement, mean_q_value_per_member
 """
 Example Computation
-# q_values = compute_ensemble_uncertainty(ensemble_agents, duplicate_batch, ensemble_size)
+# q_values = compute_ensemble_uncertainty(ensemble_agents, duplicate_batch, ensemble_size) # for (0,0,0), right now use we replace duplicate batch with single mini per-member batch
 """

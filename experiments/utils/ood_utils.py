@@ -1,17 +1,17 @@
 """Data Preparation Utilities for Offline OOD Experiments"""
-import torch
+import os
+from pathlib import Path
 import pickle
 from PIL import Image
 import numpy as np
-from pathlib import Path
+import tensorflow as tf
 
 from ml_collections import ConfigDict
 from octo.data.oxe import make_oxe_dataset_kwargs_and_weights
 from octo.utils.train_utils import filter_eval_datasets
 from octo.utils.train_callbacks import create_validation_dataset
-import tensorflow as tf
-import os
-from utils.constants import ENSEMBLE_MODEL_PATH
+
+from experiments.utils.constants import ENSEMBLE_MODEL_PATH
 
 def load_configs_for_jupyter(algorithm="ensemble_sarsa", 
                            data_dir="/V-GPS/datasets/open_x", 
@@ -34,8 +34,8 @@ def load_configs_for_jupyter(algorithm="ensemble_sarsa",
     """
     
     # Load base configs (import your actual config files)
-    from configs.data_config import get_config as get_data_config
-    from configs.train_ensemble_config import get_config as get_train_config
+    from experiments.configs.data_config import get_config as get_data_config
+    from experiments.configs.train_ensemble_config import get_config as get_train_config
     
     # Get base configurations
     train_config = get_train_config(algorithm)
@@ -140,7 +140,7 @@ def extract_trajectory_data(dataset_name: str, max_trajectories: int = None,
                            save_format: str = "pkl", mix_ratio: dict = None,
                            seed: int = 44, skip_missing_instruction: bool = True):
     """
-    Extract trajectory data from single or mixed OXE datasets with deterministic ordering.
+    Extract trajectory data from single or mixed OXE Validation datasets with deterministic ordering.
         
     Uses Octo tools to create validation set of trajectories of Bridge or Fractal dataset.
 
@@ -401,87 +401,3 @@ def load_edited_images_back(trajectories, images_dir="trajectory_images"):
     
     print(f"Loaded edited images from {images_path}")
     return trajectories
-
-
-def create_inpaintings_from_mask(data: dict, diffusion_pipeline, out_h: int= 1024, out_w: int = 1024, max_seq_len: int =512, save_path: str = None):
-    """
-    Takes a dict with key 'trajectories' dict with list of dicts with keys 'first_image', 'last_image', 'inpainting_prompt', 'first_mask', 'last_mask'.
-    Creates inpainted versions of the first and last images using the provided diffusion pipeline and inpainting prompt.
-    Updates trajectory IN-PLACE!
-
-    :param traj: trajectory dict with images, masks and inpainting prompt
-    :param diffusion_pipeline: diffusion pipeline for inpainting
-    :param out_h: output height for inpainted images
-    :param out_w: output width for inpainted images
-    :param max_seq_len: maximum sequence length for the inpainting prompt
-    :param save_path: path to save the dataset with inpainted images, if None does not save
-
-    :return: None, updates traj in-place
-    """
-    for idx, traj in enumerate(data['trajectories']):
-        if 'inpainted_first_image' in traj.keys():
-            continue
-        i1 = traj['first_image']
-        m1 = traj['first_mask']
-        i2 = traj['last_image']
-        m2 = traj['last_mask']
-        inpaint_prompt = traj['inpainting_prompt']
-        
-        i1_inpainted = pipe(
-            prompt=inpaint_prompt,
-            image=Image.fromarray(i1),
-            mask_image=Image.fromarray(m1),
-            height=out_h, # output res has to be divisible by 16
-            width=out_w,
-            max_sequence_length=max_seq_len,
-            generator=torch.Generator("cpu").manual_seed(0)
-        ).images[0]
-
-        W, H = i1.shape[:2]
-        i1_inpainted = np.array(i1_inpainted.resize((W, H), Image.Resampling.BICUBIC))
-
-        i2_inpainted = pipe(
-            prompt=inpaint_prompt,
-            image=Image.fromarray(i2),
-            mask_image=Image.fromarray(m2),
-            height=out_h, # output res has to be divisible by 16
-            width=out_w,
-            max_sequence_length=max_seq_len,
-            generator=torch.Generator("cpu").manual_seed(0)
-        ).images[0]
-        
-        W, H = i2.shape[:2]
-        i2_inpainted = np.array(i2_inpainted.resize((W, H), Image.Resampling.BICUBIC))
-
-        traj['inpainted_first_image'] = i1_inpainted
-        traj['inpainted_last_image'] = i2_inpainted
-        if idx % 10 == 0:
-            print(f"Processing trajectory {idx+1}/{len(data['trajectories'])}")
-    
-    if save_path:
-        with open(save_path, 'wb') as f:
-            pickle.dump(data, f)
-        print(f"Saved inpainted dataset to {save_path}")
-    # with open('data/bridge_v0_inpainted.pkl', 'wb') as f:
-    else:
-        return data
-    
-"""
-# if __name__ == "__main__":
-# Example Usage:
-# Load Diffusion Pipeline
-import torch
-from diffusers import FluxFillPipeline
-from diffusers.utils import load_image
-
-repo_id = "black-forest-labs/FLUX.1-Fill-dev"
-pipe = FluxFillPipeline.from_pretrained(repo_id, torch_dtype=torch.bfloat16).to("cuda")
-
-# Load Dataset
-# with open('data/bridge_v0.pkl', 'rb') as f:
-#     data = pickle.load(f)
-
-# Create Inpaintings
-# create_inpaintings_from_mask(data, pipe, save_path='data/bridge_v0_inpainted.pkl')
-
-"""
